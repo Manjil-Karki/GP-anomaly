@@ -23,6 +23,8 @@ data/*.npy
 docs/
 scripts/
 results/
+results_cls/
+
 # Results — figures tracked; raw model outputs excluded
 results/gp_results/*
 results/baseline_results/*

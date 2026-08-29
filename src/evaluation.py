@@ -73,7 +73,7 @@ def score_fold(
     normal_scores: np.ndarray,
 ) -> dict[str, Any]:
     """
-    Compute all metrics for one fold.
+    Compute all GP metrics for one fold including AUPR, RMSE, and F1.
     known_scores: GP variances for known defect types (same category, test split).
     normal_scores: GP variances for normal images (val_normal split is fine here).
     """
@@ -84,19 +84,98 @@ def score_fold(
     threshold = optimise_threshold(val_scores, val_labels)
     preds     = apply_threshold(test_scores, threshold)
 
+    # AUPR (defect-only labelling)
+    do_scores = np.concatenate([test_scores, known_scores])
+    do_labels = np.concatenate([np.ones(len(test_scores)), np.zeros(len(known_scores))])
+    aupr_val  = auprc(do_scores, do_labels)
+
+    # F1 on test split (all test images are novel = positive class)
+    tp = int(preds.sum())
+    fn = int((1 - preds).sum())
+    # FP: known-type images above threshold (if known_scores available)
+    fp = int((known_scores >= threshold).sum()) if len(known_scores) > 0 else 0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    # RMSE of GP mean on val_defective (regression calibration)
+    rmse = float("nan")
+    if "gp_mean_val_def" in gp_result and "val_severity" in gp_result:
+        mu    = np.array(gp_result["gp_mean_val_def"], dtype=np.float64)
+        y_log = np.log(np.clip(np.array(gp_result["val_severity"], dtype=np.float64), 1e-12, None))
+        rmse  = float(np.sqrt(np.mean((mu - y_log) ** 2)))
+
     return {
-        "fold_id":          gp_result["fold_id"],
-        "category":         gp_result["category"],
-        "held_out_type":    gp_result["held_out_type"],
-        "pca_dim":          gp_result["pca_dim"],
-        "threshold":        threshold,
-        "n_test":           len(test_scores),
-        "detection_rate":   float(preds.mean()),
-        "auroc_do":         defect_only_auroc(test_scores, known_scores),
-        "auroc_incl":       inclusive_auroc(test_scores, normal_scores),
-        "lml":              gp_result["lml"],
+        "fold_id":           gp_result["fold_id"],
+        "category":          gp_result["category"],
+        "held_out_type":     gp_result["held_out_type"],
+        "pca_dim":           gp_result["pca_dim"],
+        "threshold":         float(threshold),
+        "n_test":            len(test_scores),
+        "detection_rate":    float(preds.mean()),
+        "auroc_do":          defect_only_auroc(test_scores, known_scores),
+        "auroc_incl":        inclusive_auroc(test_scores, normal_scores),
+        "aupr_do":           aupr_val,
+        "f1":                float(f1),
+        "precision":         float(precision),
+        "recall":            float(recall),
+        "rmse_log_severity": rmse,
+        "lml":               gp_result["lml"],
         "pca_var_explained": gp_result.get("pca_var_explained", float("nan")),
     }
+
+
+# ---------------------------------------------------------------------------
+# Multi-method per-fold scoring
+# ---------------------------------------------------------------------------
+
+_METHOD_KEYS: dict[str, tuple[str, str, str]] = {
+    "gp":    ("val_scores",        "known_scores",       "test_scores"),
+    "knn":   ("knn_val_scores",    "knn_known_scores",   "knn_test_scores"),
+    "maha":  ("maha_val_scores",   "maha_known_scores",  "maha_test_scores"),
+    "fused": ("fused_val_scores",  "fused_known_scores", "fused_test_scores"),
+}
+
+
+def score_all_methods(
+    gp_result: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """
+    Score all available novelty methods (GP, kNN, Mahal, fused) for one fold.
+    Returns a dict keyed by method name; absent keys mean the fold predates
+    those scores (run phase 3 again with resume=True to fill them).
+    """
+    val_labels = np.array(gp_result["val_labels"])
+    out: dict[str, dict[str, Any]] = {}
+
+    for method, (val_key, known_key, test_key) in _METHOD_KEYS.items():
+        if val_key not in gp_result:
+            continue
+        val_sc   = np.array(gp_result[val_key])
+        known_sc = np.array(gp_result[known_key])
+        test_sc  = np.array(gp_result[test_key])
+        norm_sc  = val_sc[val_labels == 0]
+
+        threshold = optimise_threshold(val_sc, val_labels)
+        preds     = apply_threshold(test_sc, threshold)
+
+        do_scores = np.concatenate([test_sc, known_sc])
+        do_labels = np.concatenate([np.ones(len(test_sc)), np.zeros(len(known_sc))])
+
+        out[method] = {
+            "method":         method,
+            "fold_id":        gp_result["fold_id"],
+            "category":       gp_result["category"],
+            "held_out_type":  gp_result["held_out_type"],
+            "pca_dim":        gp_result["pca_dim"],
+            "threshold":      float(threshold),
+            "n_test":         len(test_sc),
+            "detection_rate": float(preds.mean()),
+            "auroc_do":       defect_only_auroc(test_sc, known_sc),
+            "auroc_incl":     inclusive_auroc(test_sc, norm_sc),
+            "aupr_do":        auprc(do_scores, do_labels),
+        }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +194,7 @@ def wilcoxon_test(
         return {"method": name, "statistic": 0.0, "p_value": 1.0, "significant": False}
     valid = ~np.isnan(diffs)
     stat, p = wilcoxon(gp_aucs[valid], baseline_aucs[valid], alternative="two-sided")
-    return {"method": name, "statistic": float(stat), "p_value": float(p), "significant": p < alpha}
+    return {"method": name, "statistic": float(stat), "p_value": float(p), "significant": bool(p < alpha)}
 
 
 def holm_correct(tests: list[dict[str, Any]], alpha: float = SIGNIFICANCE_LEVEL) -> list[dict]:
@@ -124,8 +203,8 @@ def holm_correct(tests: list[dict[str, Any]], alpha: float = SIGNIFICANCE_LEVEL)
     m = len(ranked)
     for k, t in enumerate(ranked):
         corrected = alpha / (m - k)
-        t["p_holm"] = min(t["p_value"] * (m - k), 1.0)
-        t["significant_holm"] = t["p_value"] < corrected
+        t["p_holm"] = float(min(t["p_value"] * (m - k), 1.0))
+        t["significant_holm"] = bool(t["p_value"] < corrected)
     return ranked
 
 

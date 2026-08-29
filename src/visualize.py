@@ -248,6 +248,7 @@ def run_method_figures(
     gp_results: list[dict[str, Any]],
     folds: list[dict[str, Any]],
     device: Optional[str] = None,
+    pca_dim: int = 16,
 ) -> None:
     """
     Called at the end of phase 3 to produce method-illustration figures.
@@ -257,7 +258,10 @@ def run_method_figures(
 
     # ── kernel selection frequency ────────────────────────────────────────
     if any("kernel_name" in r for r in gp_results):
-        plot_kernel_selection(gp_results)
+        plot_kernel_selection(
+            gp_results,
+            save_path=FIGURES_DIR / f"R_kernel_selection_pca{pca_dim}.png",
+        )
 
     # ── GP uncertainty surface ────────────────────────────────────────────
     # Pick fold with median n_train (avoids cherry-picking / worst-case)
@@ -274,6 +278,10 @@ def run_method_figures(
 
     if rep_fold is not None:
         try:
-            plot_gp_uncertainty_surface(rep_fold, device=device)
+            plot_gp_uncertainty_surface(
+                rep_fold,
+                save_path=FIGURES_DIR / f"M1_gp_uncertainty_surface_pca{pca_dim}.png",
+                device=device,
+            )
         except Exception as e:
             log.warning(f"Could not produce uncertainty surface: {e}")

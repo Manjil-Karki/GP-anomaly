@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 CLI entry point for the GP Uncertainty / Novel Defect Detection pipeline.
-
 Usage examples:
     python run_pipeline.py                         # all phases, pca_dim=16
     python run_pipeline.py --phases 0 1 2          # build manifest + folds + embeddings

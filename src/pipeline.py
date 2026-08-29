@@ -17,7 +17,7 @@ from .config import (
 from .data import build_manifest, load_manifest
 from .embeddings import cache_all_embeddings, load_dinov2, load_embeddings
 from .evaluation import (
-    holm_correct, save_json, score_fold,
+    holm_correct, save_json, score_fold, score_all_methods,
     build_fold_table, summarise, wilcoxon_test,
 )
 from .folds import (
@@ -96,34 +96,102 @@ def phase3_gp(
     # Method figures (uncertainty surface, kernel selection)
     try:
         folds = load_folds()
-        run_method_figures(results, folds, device=device)
+        run_method_figures(results, folds, device=device, pca_dim=pca_dim)
     except Exception as e:
         log.warning(f"Method figures skipped: {e}")
 
     return results
 
 
+def _emit_cost_curve(
+    gp_results: list[dict],
+    all_method: dict[str, list[dict]],
+) -> None:
+    """Save C3_cost_curve.png for the median-AUROC GP fold."""
+    import matplotlib.pyplot as plt
+    from .config import FIGURES_DIR
+    from .threshold import cost_sweep as _cs
+
+    gp_folds = all_method.get("gp", [])
+    if not gp_folds:
+        return
+
+    aurocs  = [s["auroc_do"] for s in gp_folds]
+    med_idx = int(np.argsort(aurocs)[len(aurocs) // 2])
+    rep     = gp_results[med_idx]
+
+    val_scores = np.array(rep["val_scores"])
+    val_labels = np.array(rep["val_labels"])
+    sweep      = _cs(val_scores, val_labels)
+    save_json(sweep, "cost_curve_sweep", EVAL_DIR)
+
+    ratios = [r["c_fn_c_fp_ratio"] for r in sweep]
+    miss   = [r["miss_rate"] for r in sweep]
+    alarm  = [r["false_alarm_rate"] for r in sweep]
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(ratios, miss,  "o-",  label="Miss rate  P(FN)")
+    ax.plot(ratios, alarm, "s--", label="False-alarm rate  P(FP)")
+    ax.set_xlabel("$C_{FN}/C_{FP}$ ratio")
+    ax.set_ylabel("Rate")
+    ax.set_title("Cost-Optimal Operating Points\n"
+                 f"(median-AUROC fold: {rep['fold_id']})")
+    ax.legend()
+    ax.set_xscale("log")
+    plt.tight_layout()
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    out = FIGURES_DIR / "C3_cost_curve.png"
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close()
+    log.info(f"Saved {out.name}")
+
+
 def phase4_threshold(
     gp_results: list[dict],
     df: pd.DataFrame,
 ) -> list[dict]:
-    """Optimise per-fold threshold and compute AUROC metrics."""
-    log.info("Phase 4: threshold optimisation and scoring…")
-    scored = []
+    """
+    Threshold optimisation + AUROC/AUPR for all 4 novelty methods.
+    Also runs GP calibration and generates the cost-operating curve.
+    """
+    from .calibration import run_calibration
+
+    log.info("Phase 4: threshold optimisation and multi-method scoring…")
+
+    gp_scored: list[dict] = []
+    all_method: dict[str, list[dict]] = {}
+
     for result in gp_results:
-        val_scores    = np.array(result["val_scores"])
-        val_labels    = np.array(result["val_labels"])
-        normal_scores = val_scores[val_labels == 0]
+        val_scores   = np.array(result["val_scores"])
+        val_labels   = np.array(result["val_labels"])
+        normal_sc    = val_scores[val_labels == 0]
+        known_sc     = np.array(result.get("known_scores", []))
 
-        # known_scores stored directly in fold result (GP variance on val_defective)
-        known_scores = np.array(result.get("known_scores", []))
+        # GP fold score (backward-compat key "scored_folds")
+        gp_scored.append(score_fold(result, known_sc, normal_sc))
 
-        fold_score = score_fold(result, known_scores, normal_scores)
-        scored.append(fold_score)
+        # All 4 methods
+        for method, ms in score_all_methods(result).items():
+            all_method.setdefault(method, []).append(ms)
 
-    save_json(scored, "scored_folds", EVAL_DIR)
-    log.info(f"  Mean detection rate: {np.nanmean([s['detection_rate'] for s in scored]):.3f}")
-    return scored
+    save_json(gp_scored, "scored_folds", EVAL_DIR)
+    for method, scores in all_method.items():
+        save_json(scores, f"scored_folds_{method}", EVAL_DIR)
+
+    log.info("Phase 4: GP calibration…")
+    try:
+        run_calibration(gp_results, save_dir=EVAL_DIR)
+    except Exception as e:
+        log.warning(f"Calibration skipped: {e}")
+
+    log.info("Phase 4: cost curve sweep…")
+    try:
+        _emit_cost_curve(gp_results, all_method)
+    except Exception as e:
+        log.warning(f"Cost curve skipped: {e}")
+
+    log.info(f"  GP mean detection rate: {np.nanmean([s['detection_rate'] for s in gp_scored]):.3f}")
+    return gp_scored
 
 
 def phase5_baselines(folds: list[dict], device: Optional[str] = None, resume: bool = True) -> dict:
@@ -139,16 +207,37 @@ def phase6_evaluation(
     scored_folds: list[dict],
     baseline_results: dict[str, list[dict]],
 ) -> dict:
-    """Wilcoxon + Holm tests, summary statistics, final table."""
+    """
+    Wilcoxon + Holm tests across all novelty methods and baselines.
+    Loads per-method scored folds from EVAL_DIR if available (written by phase 4).
+    """
     log.info("Phase 6: statistical evaluation…")
 
-    fold_df = build_fold_table(scored_folds)
-    summary = summarise(fold_df)
+    fold_df  = build_fold_table(scored_folds)
+    summary  = summarise(fold_df)
     gp_auroc = fold_df["auroc_do"].values
 
-    # --- compute per-fold baseline AUROC (defect-only) ---
+    # --- load per-method AUROC / AUPR from phase 4 outputs ---
+    method_aurocs: dict[str, np.ndarray] = {"gp": gp_auroc}
+    method_aupr:   dict[str, np.ndarray] = {}
+    method_dr:     dict[str, np.ndarray] = {}
+
+    for method in ("gp", "knn", "maha", "fused"):
+        p = EVAL_DIR / f"scored_folds_{method}.json"
+        if not p.exists():
+            continue
+        with open(p) as f:
+            mdf = pd.DataFrame(json.load(f))
+        method_aurocs[method] = mdf["auroc_do"].values
+        if "aupr_do" in mdf.columns:
+            method_aupr[method] = mdf["aupr_do"].values
+        if "detection_rate" in mdf.columns:
+            method_dr[method] = mdf["detection_rate"].values
+
+    # --- baseline AUROC (defect-only) ---
     baseline_aurocs: dict[str, np.ndarray] = {}
     for name, b_results in baseline_results.items():
+        from sklearn.metrics import roc_auc_score
         aucs = []
         for r in b_results:
             novel_sc = np.array(r["test_scores"])
@@ -158,7 +247,6 @@ def phase6_evaluation(
                 continue
             scores = np.concatenate([novel_sc, known_sc])
             labels = np.concatenate([np.ones(len(novel_sc)), np.zeros(len(known_sc))])
-            from sklearn.metrics import roc_auc_score
             try:
                 aucs.append(float(roc_auc_score(labels, scores)))
             except Exception:
@@ -168,13 +256,26 @@ def phase6_evaluation(
         b_df["auroc_do"] = aucs
         b_df.to_csv(EVAL_DIR / f"baseline_{name}_fold_results.csv", index=False)
 
-    # --- statistical tests ---
+    # --- statistical tests: reference = fused if available else gp ---
+    ref_name  = "fused" if "fused" in method_aurocs else "gp"
+    ref_auroc = method_aurocs[ref_name]
+
     tests = []
+    # our methods vs each other
+    for m in ("gp", "knn", "maha"):
+        if m == ref_name or m not in method_aurocs:
+            continue
+        tests.append(wilcoxon_test(ref_auroc, method_aurocs[m], f"{ref_name}_vs_{m}"))
+    # our best vs baselines
     for name, b_aucs in baseline_aurocs.items():
-        tests.append(wilcoxon_test(gp_auroc, b_aucs, name))
+        tests.append(wilcoxon_test(ref_auroc, b_aucs, f"{ref_name}_vs_{name}"))
+    # also GP vs baselines (legacy / proposal comparison)
+    if ref_name != "gp":
+        for name, b_aucs in baseline_aurocs.items():
+            tests.append(wilcoxon_test(gp_auroc, b_aucs, f"gp_vs_{name}"))
     tests = holm_correct(tests)
 
-    # --- PCA dim sweep (if multiple dims were run) ---
+    # --- PCA dim sweep figure ---
     all_dim_results: dict[int, list[dict]] = {}
     for d in [8, 12, 16]:
         p = EVAL_DIR / f"gp_pca{d}.json"
@@ -183,10 +284,32 @@ def phase6_evaluation(
                 all_dim_results[d] = json.load(f)
     if len(all_dim_results) > 1:
         try:
-            from .visualize import plot_pca_dim_sweep
             plot_pca_dim_sweep(all_dim_results)
         except Exception as e:
             log.warning(f"PCA sweep figure skipped: {e}")
+
+    # --- method comparison table ---
+    comparison_rows = []
+    for method, aucs in method_aurocs.items():
+        row: dict = {
+            "method":        method,
+            "mean_auroc_do": float(np.nanmean(aucs)),
+            "std_auroc_do":  float(np.nanstd(aucs)),
+        }
+        if method in method_aupr:
+            row["mean_aupr_do"] = float(np.nanmean(method_aupr[method]))
+        if method in method_dr:
+            row["mean_detection_rate"] = float(np.nanmean(method_dr[method]))
+        comparison_rows.append(row)
+    for name, aucs in baseline_aurocs.items():
+        comparison_rows.append({
+            "method":        f"baseline_{name}",
+            "mean_auroc_do": float(np.nanmean(aucs)),
+            "std_auroc_do":  float(np.nanstd(aucs)),
+        })
+    pd.DataFrame(comparison_rows).sort_values(
+        "mean_auroc_do", ascending=False
+    ).to_csv(EVAL_DIR / "method_comparison.csv", index=False)
 
     eval_summary = {
         "n_folds":             int(len(scored_folds)),
@@ -195,19 +318,19 @@ def phase6_evaluation(
         "mean_detection_rate": float(np.nanmean(fold_df["detection_rate"])),
         "category_summary":    summary.to_dict(orient="records"),
         "wilcoxon_tests":      tests,
-        "baseline_mean_auroc": {
-            k: float(np.nanmean(v)) for k, v in baseline_aurocs.items()
-        },
+        "method_comparison":   comparison_rows,
+        "baseline_mean_auroc": {k: float(np.nanmean(v)) for k, v in baseline_aurocs.items()},
     }
 
     save_json(eval_summary, "evaluation_summary", EVAL_DIR)
     fold_df.to_csv(EVAL_DIR / "fold_results.csv", index=False)
     summary.to_csv(EVAL_DIR / "category_summary.csv", index=False)
 
-    log.info(f"\nOverall AUROC (defect-only): {eval_summary['mean_auroc_do']:.3f} ± {eval_summary['std_auroc_do']:.3f}")
-    for name, b_aucs in baseline_aurocs.items():
-        log.info(f"  {name}: {np.nanmean(b_aucs):.3f}")
-    log.info(f"Statistical tests: {tests}")
+    log.info("\nMethod comparison (AUROC defect-only):")
+    for row in sorted(comparison_rows, key=lambda r: r["mean_auroc_do"], reverse=True):
+        aupr_s = f"  AUPR={row['mean_aupr_do']:.3f}" if "mean_aupr_do" in row else ""
+        log.info(f"  {row['method']:20s}  {row['mean_auroc_do']:.3f} ± {row['std_auroc_do']:.3f}{aupr_s}")
+    log.info(f"Statistical tests (Holm-corrected): {[t['method'] for t in tests]}")
     return eval_summary
 
 
