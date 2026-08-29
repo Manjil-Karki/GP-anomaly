@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Data — raw dataset and large caches excluded; manifests and fold JSON kept
+data/
+data/mvtec/
+data/embeddings/
+data/*.npy
+
+docs/
+scripts/
+results/
+# Results — figures tracked; raw model outputs excluded
+results/gp_results/*
+results/baseline_results/*
+results/evaluation/*
+# Keep directory structure via .gitkeep
+!results/gp_results/.gitkeep
+!results/baseline_results/.gitkeep
+!results/evaluation/.gitkeep
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Secrets / environment
+.env
+*.key
