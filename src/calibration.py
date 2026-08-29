@@ -232,25 +232,26 @@ def _pool_classification_data(
     fold_results: list[dict[str, Any]],
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Pool GP variance scores from the validation split across all folds and
-    convert to proxy probabilities for the reliability diagram (C2) and ECE.
+    Pool real GP binary class probabilities across all folds for the C2
+    reliability diagram, ECE, and Brier score.
 
-    GP variance is not a probability.  We use per-fold min-max normalisation
-    on the val set to map variance → [0, 1], then pool across folds.
-    Labels: 1 = val_defective (known defect, novelty-positive proxy),
-            0 = val_normal.
+    Uses P(log_severity > log_threshold | x) derived from the GP predictive
+    distribution (Enhancement A), replacing the previous min-max-normalised
+    GP variance proxy.  Labels are 1 when the true severity exceeds the
+    per-fold median threshold, 0 otherwise.  Only val_defective images are
+    used because val_normal images have no ground-truth severity.
     """
-    all_probs: list[np.ndarray] = []
+    all_probs:  list[np.ndarray] = []
     all_labels: list[np.ndarray] = []
     for r in fold_results:
-        if "val_scores" not in r or "val_labels" not in r:
+        if "gp_class_prob_val_def" not in r or "gp_class_labels_val_def" not in r:
             continue
-        sc = np.array(r["val_scores"], dtype=np.float64)
-        lb = np.array(r["val_labels"], dtype=np.float64)
-        lo, hi = sc.min(), sc.max()
-        probs = np.clip((sc - lo) / (hi - lo + 1e-12), 0.0, 1.0)
+        probs  = np.array(r["gp_class_prob_val_def"],   dtype=np.float64)
+        labels = np.array(r["gp_class_labels_val_def"],  dtype=np.float64)
+        if len(probs) == 0:
+            continue
         all_probs.append(probs)
-        all_labels.append(lb)
+        all_labels.append(labels)
     if not all_probs:
         return np.array([]), np.array([])
     return np.concatenate(all_probs), np.concatenate(all_labels)

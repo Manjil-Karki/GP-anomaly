@@ -246,3 +246,132 @@ def predict_gp(
         pred.mean.cpu().numpy().astype(np.float64),
         pred.variance.cpu().numpy().astype(np.float64),
     )
+
+
+# ---------------------------------------------------------------------------
+# Enhancement A — GP binary class probability (real probabilities for C2)
+# ---------------------------------------------------------------------------
+
+def gp_class_probability(
+    X_test: np.ndarray,
+    fitted: FittedGP,
+    log_threshold: float,
+) -> np.ndarray:
+    """
+    P(log_severity > log_threshold | x) from the GP predictive distribution.
+    = 1 - Φ((log_threshold − μ(x)) / σ(x))
+
+    This replaces the min-max-normalised GP variance proxy used previously.
+    The result is a true probability in [0,1] that can be used for a
+    calibrated reliability diagram (C2), Brier score, and ECE.
+    """
+    from scipy.stats import norm as _norm
+    mean, var = predict_gp(X_test, fitted)
+    sigma = np.sqrt(np.clip(var, 1e-12, None))
+    return (1.0 - _norm.cdf((log_threshold - mean) / sigma)).astype(np.float64)
+
+
+# ---------------------------------------------------------------------------
+# Enhancement B — Multi-class GP type classifier (novelty via entropy)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FittedGPClassifier:
+    model:       object   # _DirichletGPC
+    likelihood:  object   # DirichletClassificationLikelihood
+    device:      str
+    num_classes: int
+
+
+def fit_gp_type_classifier(
+    X_train: np.ndarray,
+    type_labels: np.ndarray,
+    device: Optional[str] = None,
+    max_iter: int = 100,
+) -> FittedGPClassifier:
+    """
+    Multi-class GP classifier via DirichletClassificationLikelihood (gpytorch).
+
+    Trained on known defect types; predictive entropy is high for novel types
+    that don't match any learned class.  Provides an orthogonal novelty signal
+    to GP variance, k-NN, and Mahalanobis distance.
+
+    X_train    : (N, d) PCA-compressed embeddings
+    type_labels: (N,)   int64 class indices 0 .. K-1
+    """
+    import torch
+    import gpytorch
+    from gpytorch.likelihoods import DirichletClassificationLikelihood
+    from gpytorch.distributions import MultivariateNormal
+    from gpytorch.means import ConstantMean
+    from gpytorch.models import ExactGP
+    from gpytorch.kernels import ScaleKernel, RQKernel
+    from gpytorch.mlls import ExactMarginalLogLikelihood
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    K = int(type_labels.max()) + 1
+    d = X_train.shape[1]
+
+    train_x = torch.tensor(X_train, dtype=torch.float64).to(device)
+    train_y = torch.tensor(type_labels, dtype=torch.long).to(device)
+
+    likelihood = DirichletClassificationLikelihood(
+        train_y, learn_additional_noise=True
+    ).to(device)
+
+    class _DirichletGPC(ExactGP):
+        def __init__(self, tx, ty, lik):
+            super().__init__(tx, ty, lik)
+            self.mean_module  = ConstantMean(batch_shape=torch.Size([K]))
+            self.covar_module = ScaleKernel(
+                RQKernel(ard_num_dims=d, batch_shape=torch.Size([K])),
+                batch_shape=torch.Size([K]),
+            )
+
+        def forward(self, x):
+            return MultivariateNormal(self.mean_module(x), self.covar_module(x))
+
+    model = _DirichletGPC(
+        train_x, likelihood.transformed_targets, likelihood
+    ).to(device).double()
+
+    model.train()
+    likelihood.train()
+    mll = ExactMarginalLogLikelihood(likelihood, model)
+    opt = torch.optim.Adam(model.parameters(), lr=0.1)
+
+    for _ in range(max_iter):
+        opt.zero_grad()
+        loss = -mll(model(train_x), likelihood.transformed_targets).sum()
+        loss.backward()
+        opt.step()
+
+    model.eval()
+    likelihood.eval()
+    return FittedGPClassifier(
+        model=model, likelihood=likelihood, device=device, num_classes=K
+    )
+
+
+def predict_gp_type_entropy(
+    X_test: np.ndarray,
+    fitted_clf: FittedGPClassifier,
+) -> np.ndarray:
+    """
+    Predictive entropy H = -Σ_k p_k log(p_k) from the multi-class GP.
+    High entropy → test point does not resemble any known defect type → novel.
+    Class probabilities derived from mean Dirichlet concentration parameters.
+    """
+    import torch
+    import gpytorch
+
+    test_x = torch.tensor(X_test, dtype=torch.float64).to(fitted_clf.device)
+    with torch.no_grad(), gpytorch.settings.fast_pred_var():
+        pred   = fitted_clf.likelihood(fitted_clf.model(test_x))
+        # pred.mean: (K, N) — predicted log-concentration parameters
+        alphas = pred.mean.exp().clamp(min=1e-8)        # (K, N)
+        probs  = alphas / alphas.sum(dim=0, keepdim=True)  # (K, N)
+        entropy = -(probs * (probs + 1e-10).log()).sum(dim=0)  # (N,)
+    return entropy.cpu().numpy().astype(np.float64)

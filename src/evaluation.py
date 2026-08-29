@@ -130,12 +130,13 @@ def score_fold(
 # ---------------------------------------------------------------------------
 
 _METHOD_KEYS: dict[str, tuple[str, str, str]] = {
-    "gp":   ("val_scores",      "known_scores",      "test_scores"),
-    "knn":  ("knn_val_scores",  "knn_known_scores",  "knn_test_scores"),
-    "maha": ("maha_val_scores", "maha_known_scores", "maha_test_scores"),
-    # "fused" is handled separately below — per-split stored fused scores are
-    # rank-normalised within each split independently, which destroys the
-    # cross-split ordering required for AUROC.  We recompute from raw components.
+    "gp":    ("val_scores",       "known_scores",       "test_scores"),
+    "knn":   ("knn_val_scores",   "knn_known_scores",   "knn_test_scores"),
+    "maha":  ("maha_val_scores",  "maha_known_scores",  "maha_test_scores"),
+    "gpclf": ("gpclf_val_scores", "gpclf_known_scores", "gpclf_test_scores"),
+    # "fused" and "fused5" are handled separately below — stored per-split
+    # fused scores are rank-normalised independently, destroying cross-split
+    # ordering.  We recompute from raw components with joint ranking.
 }
 
 
@@ -178,8 +179,8 @@ def score_all_methods(
             "aupr_do":        auprc(do_scores, do_labels),
         }
 
-    # Fused: recompute from raw component scores with JOINT ranking across
-    # val + test so cross-split ordering is preserved for AUROC.
+    # Fused (3-way): recompute from raw component scores with JOINT ranking
+    # across val + test so cross-split ordering is preserved for AUROC.
     _fused_req = ("val_scores", "knn_val_scores", "maha_val_scores",
                   "test_scores", "knn_test_scores", "maha_test_scores")
     if all(k in gp_result for k in _fused_req):
@@ -209,6 +210,51 @@ def score_all_methods(
 
         out["fused"] = {
             "method":         "fused",
+            "fold_id":        gp_result["fold_id"],
+            "category":       gp_result["category"],
+            "held_out_type":  gp_result["held_out_type"],
+            "pca_dim":        gp_result["pca_dim"],
+            "threshold":      float(threshold),
+            "n_test":         len(test_sc),
+            "detection_rate": float(preds.mean()),
+            "auroc_do":       defect_only_auroc(test_sc, known_sc),
+            "auroc_incl":     inclusive_auroc(test_sc, norm_sc),
+            "aupr_do":        auprc(do_sc, do_lb),
+        }
+
+    # Fused5 (4-way): GP var + kNN + Maha + GP classifier entropy, joint ranking.
+    _fused5_req = ("val_scores", "knn_val_scores", "maha_val_scores", "gpclf_val_scores",
+                   "test_scores", "knn_test_scores", "maha_test_scores", "gpclf_test_scores")
+    if all(k in gp_result for k in _fused5_req):
+        from .novelty_scores import rank_fuse as _rf
+        gp_val    = np.array(gp_result["val_scores"])
+        knn_val   = np.array(gp_result["knn_val_scores"])
+        maha_val  = np.array(gp_result["maha_val_scores"])
+        clf_val   = np.array(gp_result["gpclf_val_scores"])
+        gp_te     = np.array(gp_result["test_scores"])
+        knn_te    = np.array(gp_result["knn_test_scores"])
+        maha_te   = np.array(gp_result["maha_test_scores"])
+        clf_te    = np.array(gp_result["gpclf_test_scores"])
+        n_val     = len(gp_val)
+
+        fused5_all = _rf(
+            np.concatenate([gp_val,   gp_te]),
+            np.concatenate([knn_val,  knn_te]),
+            np.concatenate([maha_val, maha_te]),
+            np.concatenate([clf_val,  clf_te]),
+        )
+        val_sc   = fused5_all[:n_val]
+        test_sc  = fused5_all[n_val:]
+        known_sc = val_sc[val_labels == 1]
+        norm_sc  = val_sc[val_labels == 0]
+
+        threshold = optimise_threshold(val_sc, val_labels)
+        preds     = apply_threshold(test_sc, threshold)
+        do_sc = np.concatenate([test_sc, known_sc])
+        do_lb = np.concatenate([np.ones(len(test_sc)), np.zeros(len(known_sc))])
+
+        out["fused5"] = {
+            "method":         "fused5",
             "fold_id":        gp_result["fold_id"],
             "category":       gp_result["category"],
             "held_out_type":  gp_result["held_out_type"],

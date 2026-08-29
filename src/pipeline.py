@@ -222,7 +222,7 @@ def phase6_evaluation(
     method_aupr:   dict[str, np.ndarray] = {}
     method_dr:     dict[str, np.ndarray] = {}
 
-    for method in ("gp", "knn", "maha", "fused"):
+    for method in ("gp", "knn", "maha", "fused", "gpclf", "fused5"):
         p = EVAL_DIR / f"scored_folds_{method}.json"
         if not p.exists():
             continue
@@ -256,13 +256,18 @@ def phase6_evaluation(
         b_df["auroc_do"] = aucs
         b_df.to_csv(EVAL_DIR / f"baseline_{name}_fold_results.csv", index=False)
 
-    # --- statistical tests: reference = fused if available else gp ---
-    ref_name  = "fused" if "fused" in method_aurocs else "gp"
+    # --- statistical tests: reference = best fusion method available ---
+    for candidate in ("fused5", "fused", "gp"):
+        if candidate in method_aurocs:
+            ref_name = candidate
+            break
+    else:
+        ref_name = "gp"
     ref_auroc = method_aurocs[ref_name]
 
     tests = []
     # our methods vs each other
-    for m in ("gp", "knn", "maha"):
+    for m in ("gp", "knn", "maha", "gpclf", "fused", "fused5"):
         if m == ref_name or m not in method_aurocs:
             continue
         tests.append(wilcoxon_test(ref_auroc, method_aurocs[m], f"{ref_name}_vs_{m}"))

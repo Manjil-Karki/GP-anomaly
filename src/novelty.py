@@ -11,7 +11,11 @@ import numpy as np
 from .config import GP_RESULTS_DIR, EMBEDDINGS_DIR
 from .embeddings import load_embeddings
 from .folds import load_folds
-from .gp_model import FittedGP, fit_gp, predict_gp
+from .gp_model import (
+    FittedGP, fit_gp, predict_gp,
+    gp_class_probability,
+    FittedGPClassifier, fit_gp_type_classifier, predict_gp_type_entropy,
+)
 from .novelty_scores import knn_score, mahalanobis_score, rank_fuse
 from .pca_transform import FoldPCA, fit_fold_pca
 
@@ -102,6 +106,50 @@ def run_single_fold(
     fused_vn = _fused_all[n_vd:n_vd + n_vn]
     fused_te = _fused_all[n_vd + n_vn:]
 
+    # ── 4a. Enhancement A — binary GP class probability for C2 ────────────
+    # Threshold at median log-severity of training set (≈ 50% positive class).
+    log_thresh = float(np.median(y_train))
+    gp_cls_prob_vd = gp_class_probability(X_vd.astype(np.float64), fitted, log_thresh)
+    val_def_sev    = np.array(fold["val_severity"], dtype=np.float64)
+    gp_cls_labels_vd = (np.log(np.clip(val_def_sev, 1e-12, None)) > log_thresh).astype(np.float64)
+
+    # ── 4b. Enhancement B — multi-class GP type classifier ────────────────
+    gpclf_entropy_vd = gpclf_entropy_vn = gpclf_entropy_te = None
+    try:
+        from pathlib import Path as _Path
+        type_names  = [_Path(p).parent.name for p in train_paths]
+        unique_types = sorted(set(type_names))
+        if len(unique_types) >= 2:
+            t2i         = {t: i for i, t in enumerate(unique_types)}
+            type_labels = np.array([t2i[t] for t in type_names], dtype=np.int64)
+            fitted_clf  = fit_gp_type_classifier(
+                X_tr.astype(np.float64), type_labels, device=device
+            )
+            gpclf_entropy_vd = predict_gp_type_entropy(X_vd.astype(np.float64), fitted_clf)
+            gpclf_entropy_vn = predict_gp_type_entropy(X_vn.astype(np.float64), fitted_clf)
+            gpclf_entropy_te = predict_gp_type_entropy(X_te.astype(np.float64), fitted_clf)
+            log.info(f"  GP classifier: K={len(unique_types)} types, "
+                     f"test_entropy={gpclf_entropy_te.mean():.3f} "
+                     f"val_def_entropy={gpclf_entropy_vd.mean():.3f}")
+        else:
+            log.warning("  GP classifier skipped: only 1 unique type in training fold")
+    except Exception as exc:
+        log.warning(f"  GP classifier failed: {exc}")
+
+    # 4-way rank fusion (GP var + kNN + Maha + GP classifier entropy)
+    if gpclf_entropy_te is not None:
+        _fused5_all = rank_fuse(
+            np.concatenate([gp_var_vd, gp_var_vn, gp_var_te]),
+            np.concatenate([knn_vd,    knn_vn,    knn_te]),
+            np.concatenate([maha_vd,   maha_vn,   maha_te]),
+            np.concatenate([gpclf_entropy_vd, gpclf_entropy_vn, gpclf_entropy_te]),
+        )
+        fused5_vd = _fused5_all[:n_vd]
+        fused5_vn = _fused5_all[n_vd:n_vd + n_vn]
+        fused5_te = _fused5_all[n_vd + n_vn:]
+    else:
+        fused5_vd = fused5_vn = fused5_te = None
+
     # ── 5. Combine val splits for threshold optimisation ──────────────────
     # Labels: 1 = known defective (positive for novelty task), 0 = normal
     val_labels = np.concatenate([
@@ -112,7 +160,7 @@ def run_single_fold(
     def _val(a, b):
         return np.concatenate([a, b]).tolist()
 
-    return {
+    result: dict = {
         # ── Fold metadata ─────────────────────────────────────────────────
         "fold_id":           fold["fold_id"],
         "category":          fold["category"],
@@ -150,7 +198,25 @@ def run_single_fold(
         "val_severity":      fold["val_severity"],
         "test_severity":     fold["test_severity"],
         "test_defect_types": fold["test_defect_types"],
+
+        # ── Enhancement A: real GP binary class probabilities (for C2) ────
+        "gp_class_prob_val_def":    gp_cls_prob_vd.tolist(),
+        "gp_class_labels_val_def":  gp_cls_labels_vd.tolist(),
+        "severity_log_threshold":   log_thresh,
     }
+
+    # Enhancement B: GP type classifier entropy scores (optional)
+    if gpclf_entropy_te is not None:
+        result.update({
+            "gpclf_val_scores":    _val(gpclf_entropy_vd, gpclf_entropy_vn),
+            "gpclf_known_scores":  gpclf_entropy_vd.tolist(),
+            "gpclf_test_scores":   gpclf_entropy_te.tolist(),
+            "fused5_val_scores":   _val(fused5_vd, fused5_vn),
+            "fused5_known_scores": fused5_vd.tolist(),
+            "fused5_test_scores":  fused5_te.tolist(),
+        })
+
+    return result
 
 
 def run_all_folds(
@@ -178,8 +244,8 @@ def run_all_folds(
         if resume and out_path.exists():
             with open(out_path) as f:
                 cached = json.load(f)
-            # Skip only if new score keys are already present
-            if "fused_test_scores" in cached:
+            # Skip only if both fused and GP-classifier keys are present
+            if "fused_test_scores" in cached and "gpclf_test_scores" in cached:
                 log.info(f"[{i+1}/{len(folds)}] Skip {fid} (cached)")
                 results.append(cached)
                 continue

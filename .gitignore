@@ -24,7 +24,7 @@ docs/
 scripts/
 results/
 results_cls/
-
+results_v2/
 # Results — figures tracked; raw model outputs excluded
 results/gp_results/*
 results/baseline_results/*
