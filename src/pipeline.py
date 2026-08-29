@@ -275,13 +275,14 @@ def phase6_evaluation(
             tests.append(wilcoxon_test(gp_auroc, b_aucs, f"gp_vs_{name}"))
     tests = holm_correct(tests)
 
-    # --- PCA dim sweep figure ---
+    # --- PCA dim sweep figure (load all gp_pca*.json files present) ---
+    import re as _re
     all_dim_results: dict[int, list[dict]] = {}
-    for d in [8, 12, 16]:
-        p = EVAL_DIR / f"gp_pca{d}.json"
-        if p.exists():
+    for p in sorted(EVAL_DIR.glob("gp_pca*.json")):
+        m = _re.search(r"gp_pca(\d+)\.json$", p.name)
+        if m:
             with open(p) as f:
-                all_dim_results[d] = json.load(f)
+                all_dim_results[int(m.group(1))] = json.load(f)
     if len(all_dim_results) > 1:
         try:
             plot_pca_dim_sweep(all_dim_results)
@@ -404,7 +405,7 @@ def run_pipeline(
                 scored = json.load(f)
         if bl_res is None:
             bl_res = {}
-            for name in ("ensemble", "mc_dropout"):
+            for name in ("ensemble", "mc_dropout", "padim", "patchcore"):
                 p = EVAL_DIR / f"baseline_{name}.json"
                 if p.exists():
                     with open(p) as f:

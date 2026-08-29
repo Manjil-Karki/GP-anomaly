@@ -228,6 +228,34 @@ def plot_reliability_diagram(
     return save_path
 
 
+def _pool_classification_data(
+    fold_results: list[dict[str, Any]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Pool GP variance scores from the validation split across all folds and
+    convert to proxy probabilities for the reliability diagram (C2) and ECE.
+
+    GP variance is not a probability.  We use per-fold min-max normalisation
+    on the val set to map variance → [0, 1], then pool across folds.
+    Labels: 1 = val_defective (known defect, novelty-positive proxy),
+            0 = val_normal.
+    """
+    all_probs: list[np.ndarray] = []
+    all_labels: list[np.ndarray] = []
+    for r in fold_results:
+        if "val_scores" not in r or "val_labels" not in r:
+            continue
+        sc = np.array(r["val_scores"], dtype=np.float64)
+        lb = np.array(r["val_labels"], dtype=np.float64)
+        lo, hi = sc.min(), sc.max()
+        probs = np.clip((sc - lo) / (hi - lo + 1e-12), 0.0, 1.0)
+        all_probs.append(probs)
+        all_labels.append(lb)
+    if not all_probs:
+        return np.array([]), np.array([])
+    return np.concatenate(all_probs), np.concatenate(all_labels)
+
+
 def run_calibration(
     fold_results: list[dict[str, Any]],
     save_dir: Path = EVAL_DIR,
@@ -235,6 +263,9 @@ def run_calibration(
     """
     Entry point called from pipeline phase 4.
     Computes all calibration metrics and saves figures + JSON.
+    Produces:
+      C1 — PIT histogram (GP regression posterior)
+      C2 — Reliability diagram + ECE + Brier score (classification head)
     """
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     cal = calibrate_folds(fold_results)
@@ -242,9 +273,20 @@ def run_calibration(
     if cal["pit_values"]:
         plot_pit_histogram(cal["pit_values"])
 
-    # Save calibration summary (without the raw pit_values list for readability)
+    # C2: classification calibration using normalised GP variance as prob proxy
+    probs, labels = _pool_classification_data(fold_results)
+    bs_val  = float("nan")
+    ece_val = float("nan")
+    if len(probs) > 0:
+        bs_val  = brier_score(probs, labels)
+        ece_val = ece(probs, labels, n_bins=15)
+        plot_reliability_diagram(probs, labels)
+        log.info(f"Classification calibration: ECE={ece_val:.4f}  Brier={bs_val:.4f}")
+
     summary = {k: v for k, v in cal.items() if k != "pit_values"}
     summary["target_90pct_coverage"] = 0.90
+    summary["brier_score"]           = bs_val
+    summary["ece"]                   = ece_val
 
     out = save_dir / "calibration_summary.json"
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -252,6 +294,5 @@ def run_calibration(
         json.dump(summary, f, indent=2)
 
     log.info(f"Calibration: RMSE={cal['mean_rmse']:.4f}, "
-             f"90% coverage={cal['mean_90pct_coverage']:.3f} "
-             f"(target 0.90)")
+             f"90% coverage={cal['mean_90pct_coverage']:.3f} (target 0.90)")
     return summary

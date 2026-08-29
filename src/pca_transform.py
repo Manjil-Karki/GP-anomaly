@@ -39,11 +39,13 @@ def fit_fold_pca(X_train: np.ndarray, n_components: int) -> FoldPCA:
     """
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_train)
-    pca = PCA(n_components=n_components, random_state=42)
+    # Clamp n_components to the data rank to avoid sklearn ValueError
+    n_comp = min(n_components, X_scaled.shape[0] - 1, X_scaled.shape[1])
+    pca = PCA(n_components=n_comp, random_state=42)
     pca.fit(X_scaled)
     return FoldPCA(
         pca=pca,
         scaler=scaler,
-        n_components=n_components,
+        n_components=n_comp,
         explained_variance_ratio=pca.explained_variance_ratio_.copy(),
     )

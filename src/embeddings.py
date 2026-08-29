@@ -1,25 +1,28 @@
 """DINOv2 ViT-B/14 feature extraction with on-disk caching.
 
-Embedding strategy: mean of spatial patch tokens, L2-normalised.
+Embedding strategy: CLS token + mean of spatial patch tokens, concatenated
+and individually L2-normalised → 1536-dim (2 × 768).
 
-Why not the CLS token (original approach)?
-  The CLS token summarises global image semantics ("this is a capsule").
-  With IMAGE_SIZE=518 and patch_size=14 the model produces 37×37=1369 patch
-  tokens — one per 14×14-pixel region.  A defect occupies a small fraction of
-  those regions; its signal is heavily diluted in the CLS token but preserved
-  in the spatial mean.  Switching to patch-mean embeddings makes the GP's
-  input space more sensitive to local texture anomalies.
+Why concatenate CLS and patch-mean?
+  The CLS token encodes global structural context ("this is a screw") while
+  the spatial mean of 37×37=1369 patch tokens (one per 14×14-pixel region)
+  captures local texture and appearance anomalies.  For LODTO novelty
+  detection both signals matter:
+    • Global context lets the GP generalise across defect categories that
+      share a texture class (e.g. leather, wood).
+    • Local patch-mean detects subtle surface defects that are diluted in
+      the CLS aggregation.
+  Prior ablations showed CLS-only → 0.547 AUROC, patch-mean-only → 0.559.
+  Concatenation is expected to recover categories that regressed when
+  switching to patch-mean alone (screw, transistor, leather).
 
-Why L2-normalise?
-  ViT patch tokens lie approximately on a hypersphere.  The GP kernels (RBF,
-  Matérn) assume Euclidean distances; applying those to unnormalised tokens
-  distorts the geometry.  L2-normalising maps all embeddings to the unit sphere
-  so Euclidean distance equals √2·(1 − cos θ) — a monotone function of cosine
-  distance — and the kernel length-scale has a consistent interpretation across
-  folds and categories.
+Why L2-normalise each part independently before concatenating?
+  Both sub-vectors are brought to the unit sphere so neither dominates the
+  Euclidean distances used by the GP kernels.  After concatenation the
+  combined vector lives on a 1535-dimensional product-of-sphere manifold
+  where each half contributes equally to kernel evaluations.
 
-Cache note: if you have an existing cache built with CLS tokens, delete
-  data/embeddings/ before running phase 2 with this version.
+Cache note: delete data/embeddings/ before running phase 2 with this version.
 
 torch/torchvision are imported lazily so phases 0-1 work without the GPU stack.
 """
@@ -79,17 +82,21 @@ def _path_key(path: str) -> str:
     return hashlib.md5(path.encode()).hexdigest()
 
 
-def _patch_mean_embedding(model, x) -> "torch.Tensor":
+def _concat_cls_patch_embedding(model, x) -> "torch.Tensor":
     """
-    Extract L2-normalised mean patch token embedding from a DINOv2 batch.
+    Extract CLS + patch-mean concatenated embedding from a DINOv2 batch.
     x: (B, 3, H, W) tensor already on the correct device.
-    Returns (B, 768) float32 tensor on the same device.
+    Returns (B, 1536) float32 tensor: [L2(cls) | L2(patch_mean)].
     """
+    import torch
     import torch.nn.functional as F
-    features = model.forward_features(x)          # dict from DINOv2
-    patches  = features["x_norm_patchtokens"]     # (B, n_patches, 768)
-    emb      = patches.mean(dim=1)                # (B, 768) — spatial mean
-    return F.normalize(emb, p=2, dim=-1)          # unit-sphere L2 norm
+    features   = model.forward_features(x)          # dict from DINOv2
+    cls_token  = features["x_norm_clstoken"]        # (B, 768)
+    patches    = features["x_norm_patchtokens"]     # (B, n_patches, 768)
+    patch_mean = patches.mean(dim=1)                # (B, 768) — spatial mean
+    cls_norm   = F.normalize(cls_token,  p=2, dim=-1)
+    patch_norm = F.normalize(patch_mean, p=2, dim=-1)
+    return torch.cat([cls_norm, patch_norm], dim=-1)  # (B, 1536)
 
 
 def extract_embeddings(
@@ -98,7 +105,7 @@ def extract_embeddings(
     device: str,
     batch_size: int = EMBED_BATCH_SIZE,
 ) -> np.ndarray:
-    """Return (N, 768) float32 patch-mean L2-normalised embeddings."""
+    """Return (N, 1536) float32 CLS+patch-mean L2-normalised embeddings."""
     import torch
     transform = _get_transform()
     all_embs: list[np.ndarray] = []
@@ -107,7 +114,7 @@ def extract_embeddings(
         tensors = [transform(Image.open(p).convert("RGB")) for p in batch]
         x = torch.stack(tensors).to(device)
         with torch.no_grad():
-            emb = _patch_mean_embedding(model, x)
+            emb = _concat_cls_patch_embedding(model, x)
         all_embs.append(emb.cpu().numpy().astype(np.float32))
     return np.concatenate(all_embs, axis=0)
 
@@ -146,7 +153,7 @@ def cache_all_embeddings(
         tensors = [transform(Image.open(p).convert("RGB")) for p in batch_paths]
         x = torch.stack(tensors).to(device)
         with torch.no_grad():
-            embs = _patch_mean_embedding(model, x).cpu().numpy().astype(np.float32)
+            embs = _concat_cls_patch_embedding(model, x).cpu().numpy().astype(np.float32)
 
         for path, emb in zip(batch_paths, embs):
             key = _path_key(path)
@@ -165,7 +172,7 @@ def load_embeddings(
     paths: list[str],
     cache_dir: Path = EMBEDDINGS_DIR,
 ) -> np.ndarray:
-    """Load (N, 768) float32 array from cache. Raises KeyError if any path missing."""
+    """Load (N, 1536) float32 array from cache. Raises KeyError if any path missing."""
     index_path = cache_dir / "index.json"
     with open(index_path) as f:
         index: dict[str, str] = json.load(f)

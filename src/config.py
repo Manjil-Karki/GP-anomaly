@@ -19,7 +19,7 @@ EVAL_DIR            = RESULTS_DIR / "evaluation"
 IMAGE_SIZE = 518  # DINOv2 ViT-B/14 native resolution
 
 # --- PCA sweep ---
-PCA_DIMS = [8, 12, 16]
+PCA_DIMS = [8, 12, 16, 32]
 
 # --- GP optimisation ---
 GP_N_RESTARTS = 10
@@ -56,5 +56,6 @@ ALL_CATEGORIES = [
 ]
 LODTO_CATEGORIES = [c for c in ALL_CATEGORIES if c != "toothbrush"]
 
-# --- DINOv2 ViT-B/14 output dimension ---
-DINO_EMBED_DIM = 768
+# --- DINOv2 ViT-B/14 output dimension per token ---
+# Embedding strategy: [L2(cls) | L2(patch_mean)] → 2 × 768 = 1536 stored per image
+DINO_EMBED_DIM = 1536

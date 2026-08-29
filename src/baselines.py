@@ -134,41 +134,61 @@ def mc_dropout_scores(
 
 
 # ---------------------------------------------------------------------------
-# PaDiM / PatchCore via anomalib
+# PaDiM-like and PatchCore-like baselines (embedding-level)
+#
+# Both train on NORMAL images and detect deviation from normality.
+# This is the standard anomaly detection paradigm, unlike our GP which trains
+# on known defect types. These serve as reference comparisons showing what a
+# normal-distribution baseline can achieve on the LODTO task.
+#
+# PaDiM-like: fit a multivariate Gaussian on PCA-compressed normal embeddings,
+#   score = Mahalanobis distance from the normal distribution.
+#   (PaDiM: Defard et al. 2021 — our version operates on mean patch tokens
+#   rather than per-position patch features due to storage constraints.)
+#
+# PatchCore-like: nearest-neighbour distance from a coreset of normal
+#   embeddings.  (PatchCore: Roth et al. CVPR 2022 — our version uses mean
+#   patch tokens as the memory bank entries.)
 # ---------------------------------------------------------------------------
 
-def _anomalib_scores(
-    model_name: str,
-    train_paths: list[str],
-    test_paths: list[str],
-    category: str,
-    device: Optional[str] = None,
-) -> np.ndarray:
-    try:
-        import anomalib  # noqa: F401
-    except ImportError:
-        log.warning(f"anomalib not installed; {model_name} unavailable.")
-        return np.full(len(test_paths), np.nan)
-    log.warning(f"{model_name}: anomalib datamodule wiring pending (Phase 7).")
-    return np.full(len(test_paths), np.nan)
+def _pca_reduce(X_train: np.ndarray, X_test: np.ndarray, n_components: int = 32):
+    """Fit PCA on training data, apply to both. Returns (X_tr_pca, X_te_pca)."""
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    X_tr = scaler.fit_transform(X_train)
+    n_comp = min(n_components, X_tr.shape[0] - 1, X_tr.shape[1])
+    pca = PCA(n_components=n_comp, random_state=42)
+    X_tr_pca = pca.fit_transform(X_tr)
+    X_te_pca = pca.transform(scaler.transform(X_test))
+    return X_tr_pca, X_te_pca
 
 
 def padim_scores(
-    train_paths: list[str],
-    test_paths: list[str],
-    category: str,
-    device: Optional[str] = None,
+    X_train_normal: np.ndarray,
+    X_test: np.ndarray,
+    pca_dim: int = 32,
 ) -> np.ndarray:
-    return _anomalib_scores("PaDiM", train_paths, test_paths, category, device)
+    """
+    PaDiM-like novelty score: Mahalanobis distance from the normal-image
+    distribution in PCA-reduced embedding space.
+    """
+    from .novelty_scores import mahalanobis_score
+    X_tr, X_te = _pca_reduce(X_train_normal, X_test, pca_dim)
+    return mahalanobis_score(X_te, X_tr)
 
 
 def patchcore_scores(
-    train_paths: list[str],
-    test_paths: list[str],
-    category: str,
-    device: Optional[str] = None,
+    X_train_normal: np.ndarray,
+    X_test: np.ndarray,
+    k: int = 1,
 ) -> np.ndarray:
-    return _anomalib_scores("PatchCore", train_paths, test_paths, category, device)
+    """
+    PatchCore-like novelty score: nearest-neighbour distance from the normal-
+    image memory bank in the full embedding space.
+    """
+    from .novelty_scores import knn_score
+    return knn_score(X_test, X_train_normal, k=k)
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +206,11 @@ def run_baseline_folds(
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     BASELINE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    results: dict[str, list[dict]] = {"ensemble": [], "mc_dropout": []}
+    results: dict[str, list[dict]] = {
+        "ensemble": [], "mc_dropout": [], "padim": [], "patchcore": []
+    }
 
-    for name in ("ensemble", "mc_dropout"):
+    for name in ("ensemble", "mc_dropout", "padim", "patchcore"):
         out_dir = BASELINE_RESULTS_DIR / name
         out_dir.mkdir(exist_ok=True)
 
@@ -211,16 +233,22 @@ def run_baseline_folds(
             if name == "ensemble":
                 scores_novel = deep_ensemble_scores(X_norm, X_test,  device=device)
                 scores_known = deep_ensemble_scores(X_norm, X_known, device=device)
-            else:
+            elif name == "mc_dropout":
                 scores_novel = mc_dropout_scores(X_norm, X_test,  device=device)
                 scores_known = mc_dropout_scores(X_norm, X_known, device=device)
+            elif name == "padim":
+                scores_novel = padim_scores(X_norm, X_test)
+                scores_known = padim_scores(X_norm, X_known)
+            else:  # patchcore
+                scores_novel = patchcore_scores(X_norm, X_test)
+                scores_known = patchcore_scores(X_norm, X_known)
 
             record = {
                 "fold_id":       fid,
                 "category":      fold["category"],
                 "held_out_type": fold["held_out_type"],
-                "test_scores":   scores_novel.tolist(),   # novel defectives
-                "known_scores":  scores_known.tolist(),   # known defectives (for AUROC)
+                "test_scores":   scores_novel.tolist(),
+                "known_scores":  scores_known.tolist(),
                 "n_test":        len(X_test),
             }
             with open(out_path, "w") as f:

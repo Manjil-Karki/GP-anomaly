@@ -2,7 +2,7 @@
 """
 CLI entry point for the GP Uncertainty / Novel Defect Detection pipeline.
 Usage examples:
-    python run_pipeline.py                         # all phases, pca_dim=16
+    python run_pipeline.py                         # all phases, pca_dim=32
     python run_pipeline.py --phases 0 1 2          # build manifest + folds + embeddings
     python run_pipeline.py --phases 3 --pca-dim 8  # GP only, d=8
     python run_pipeline.py --phases 4 5 6          # scoring, baselines, evaluation
@@ -28,8 +28,8 @@ def main() -> None:
         help="Pipeline phases to run (0–6). Default: all.",
     )
     parser.add_argument(
-        "--pca-dim", type=int, default=16, choices=[8, 12, 16],
-        help="PCA latent dimension for GP input (default: 16).",
+        "--pca-dim", type=int, default=32,
+        help="PCA latent dimension for GP input (default: 32).",
     )
     parser.add_argument(
         "--device", type=str, default=None,

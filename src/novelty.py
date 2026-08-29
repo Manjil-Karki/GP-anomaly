@@ -88,10 +88,19 @@ def run_single_fold(
     gp_var_vn,  knn_vn,  maha_vn  = _score_split(X_vn, X_tr, fitted)
     gp_var_te,  knn_te,  maha_te  = _score_split(X_te, X_tr, fitted)
 
-    # Rank-fused scores (proposed method: GP + k-NN + Mahalanobis)
-    fused_vd = rank_fuse(gp_var_vd, knn_vd, maha_vd)
-    fused_vn = rank_fuse(gp_var_vn, knn_vn, maha_vn)
-    fused_te = rank_fuse(gp_var_te, knn_te, maha_te)
+    # Rank-fused scores: ranks computed JOINTLY across all three splits so
+    # the cross-split ordering (novel > known) is preserved for AUROC.
+    # Per-split rank normalisation destroys this ordering (both val_def and
+    # test end up uniform on [0,1] independently → AUROC ≈ 0.5).
+    n_vd, n_vn = len(gp_var_vd), len(gp_var_vn)
+    _fused_all = rank_fuse(
+        np.concatenate([gp_var_vd, gp_var_vn, gp_var_te]),
+        np.concatenate([knn_vd,    knn_vn,    knn_te]),
+        np.concatenate([maha_vd,   maha_vn,   maha_te]),
+    )
+    fused_vd = _fused_all[:n_vd]
+    fused_vn = _fused_all[n_vd:n_vd + n_vn]
+    fused_te = _fused_all[n_vd + n_vn:]
 
     # ── 5. Combine val splits for threshold optimisation ──────────────────
     # Labels: 1 = known defective (positive for novelty task), 0 = normal

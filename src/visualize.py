@@ -54,6 +54,7 @@ def plot_gp_uncertainty_surface(
     save_path: Optional[Path] = None,
     device: Optional[str] = None,
     n_grid: int = 120,
+    pca_dim: int = 16,
 ) -> Path:
     """
     2D PCA visualization of GP posterior variance for one representative fold.
@@ -132,7 +133,7 @@ def plot_gp_uncertainty_surface(
     ax.set_ylabel("PCA component 2 (visualization only)")
     ax.set_title(
         f"GP Posterior Variance — {fold['category']} / held-out: {fold['held_out_type']}\n"
-        f"(2-D visualization GP; production model uses d=16)",
+        f"(2-D visualization GP; production model uses d={pca_dim})",
         fontsize=9.5,
     )
     ax.legend(loc="upper left", fontsize=8.5, framealpha=0.85)
@@ -282,6 +283,7 @@ def run_method_figures(
                 rep_fold,
                 save_path=FIGURES_DIR / f"M1_gp_uncertainty_surface_pca{pca_dim}.png",
                 device=device,
+                pca_dim=pca_dim,
             )
         except Exception as e:
             log.warning(f"Could not produce uncertainty surface: {e}")
