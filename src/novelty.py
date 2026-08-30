@@ -16,7 +16,7 @@ from .gp_model import (
     gp_class_probability,
     FittedGPClassifier, fit_gp_type_classifier, predict_gp_type_entropy,
 )
-from .novelty_scores import knn_score, mahalanobis_score, rank_fuse
+from .novelty_scores import knn_score, mahalanobis_score, prototype_distance_score, rank_fuse
 from .pca_transform import FoldPCA, fit_fold_pca
 
 log = logging.getLogger(__name__)
@@ -35,6 +35,38 @@ def _score_split(
     knn       = knn_score(X, X_train, k=KNN_K)
     maha      = mahalanobis_score(X, X_train)
     return gp_var, knn, maha
+
+
+def _calibrate_variance_scale(
+    gp_mean_vd: np.ndarray,
+    gp_var_vd: np.ndarray,
+    val_def_sev: np.ndarray,
+    target: float = 0.90,
+) -> float:
+    """
+    Find T ≥ 1 such that (target)% of val_def images fall inside the
+    T-scaled (target)% GP predictive interval.  Fixes ExactGP overconfidence.
+    Returns T=1.0 if the data are already calibrated or if search fails.
+    """
+    from scipy.optimize import brentq
+    from scipy.stats import norm as _norm
+    z = _norm.ppf((1 + target) / 2)
+    y_log = np.log(np.clip(val_def_sev, 1e-12, None))
+
+    def coverage(T: float) -> float:
+        sigma = T * np.sqrt(np.clip(gp_var_vd, 1e-12, None))
+        lo = gp_mean_vd - z * sigma
+        hi = gp_mean_vd + z * sigma
+        return float(np.mean((y_log >= lo) & (y_log <= hi))) - target
+
+    try:
+        # If already over-covered at T=1.0, no inflation needed
+        if coverage(1.0) >= 0:
+            return 1.0
+        T_opt = brentq(coverage, 1.0, 200.0, xtol=1e-3)
+        return float(T_opt)
+    except (ValueError, RuntimeError):
+        return 1.0
 
 
 def run_single_fold(
@@ -108,35 +140,87 @@ def run_single_fold(
 
     # ── 4a. Enhancement A — binary GP class probability for C2 ────────────
     # Threshold at median log-severity of training set (≈ 50% positive class).
-    log_thresh = float(np.median(y_train))
-    gp_cls_prob_vd = gp_class_probability(X_vd.astype(np.float64), fitted, log_thresh)
-    val_def_sev    = np.array(fold["val_severity"], dtype=np.float64)
+    log_thresh  = float(np.median(y_train))
+    val_def_sev = np.array(fold["val_severity"], dtype=np.float64)
     gp_cls_labels_vd = (np.log(np.clip(val_def_sev, 1e-12, None)) > log_thresh).astype(np.float64)
 
+    # Post-hoc variance calibration: find T ≥ 1 that inflates GP sigma until
+    # 90% of val_def images fall within the 90% predictive interval.
+    # Fixes systematic ExactGP overconfidence without retraining.
+    T_cal = _calibrate_variance_scale(gp_mean_vd, gp_var_vd, val_def_sev, target=0.90)
+    gp_cls_prob_vd = gp_class_probability(
+        X_vd.astype(np.float64), fitted, log_thresh, variance_scale=T_cal
+    )
+    log.info(f"  Variance calibration: T={T_cal:.3f}")
+
     # ── 4b. Enhancement B — multi-class GP type classifier ────────────────
+    # Use a lower PCA sub-dimension for the classifier: with 20-120 training
+    # images split across K types, 32-dim ARD is severely underdetermined.
+    # Restricting to the top 16 components gives cleaner class boundaries.
+    CLF_PCA_DIM = min(pca_dim, 16)
     gpclf_entropy_vd = gpclf_entropy_vn = gpclf_entropy_te = None
+    proto_vd = proto_vn = proto_te = None
+    type_labels_arr = None
     try:
         from pathlib import Path as _Path
-        type_names  = [_Path(p).parent.name for p in train_paths]
+        type_names   = [_Path(p).parent.name for p in train_paths]
         unique_types = sorted(set(type_names))
         if len(unique_types) >= 2:
-            t2i         = {t: i for i, t in enumerate(unique_types)}
-            type_labels = np.array([t2i[t] for t in type_names], dtype=np.int64)
-            fitted_clf  = fit_gp_type_classifier(
-                X_tr.astype(np.float64), type_labels, device=device
-            )
-            gpclf_entropy_vd = predict_gp_type_entropy(X_vd.astype(np.float64), fitted_clf)
-            gpclf_entropy_vn = predict_gp_type_entropy(X_vn.astype(np.float64), fitted_clf)
-            gpclf_entropy_te = predict_gp_type_entropy(X_te.astype(np.float64), fitted_clf)
-            log.info(f"  GP classifier: K={len(unique_types)} types, "
-                     f"test_entropy={gpclf_entropy_te.mean():.3f} "
-                     f"val_def_entropy={gpclf_entropy_vd.mean():.3f}")
+            t2i             = {t: i for i, t in enumerate(unique_types)}
+            type_labels_arr = np.array([t2i[t] for t in type_names], dtype=np.int64)
+
+            # Prototype distance (per-class Maha) — fast, no GP needed
+            proto_vd = prototype_distance_score(X_vd[:, :CLF_PCA_DIM], X_tr[:, :CLF_PCA_DIM], type_labels_arr)
+            proto_vn = prototype_distance_score(X_vn[:, :CLF_PCA_DIM], X_tr[:, :CLF_PCA_DIM], type_labels_arr)
+            proto_te = prototype_distance_score(X_te[:, :CLF_PCA_DIM], X_tr[:, :CLF_PCA_DIM], type_labels_arr)
+
+            # DirichletGPC: 200 iterations, 3 restarts — keep run with lowest
+            # mean training entropy (= most confident on known types)
+            best_clf        = None
+            best_train_ent  = np.inf
+            for _restart in range(3):
+                try:
+                    _clf = fit_gp_type_classifier(
+                        X_tr[:, :CLF_PCA_DIM].astype(np.float64),
+                        type_labels_arr,
+                        device=device,
+                        max_iter=200,
+                    )
+                    _tr_ent = predict_gp_type_entropy(
+                        X_tr[:, :CLF_PCA_DIM].astype(np.float64), _clf
+                    ).mean()
+                    if _tr_ent < best_train_ent:
+                        best_train_ent = _tr_ent
+                        best_clf = _clf
+                except Exception:
+                    pass
+
+            if best_clf is not None:
+                gpclf_entropy_vd = predict_gp_type_entropy(X_vd[:, :CLF_PCA_DIM].astype(np.float64), best_clf)
+                gpclf_entropy_vn = predict_gp_type_entropy(X_vn[:, :CLF_PCA_DIM].astype(np.float64), best_clf)
+                gpclf_entropy_te = predict_gp_type_entropy(X_te[:, :CLF_PCA_DIM].astype(np.float64), best_clf)
+                log.info(f"  GP classifier: K={len(unique_types)} types, "
+                         f"clf_pca={CLF_PCA_DIM}, "
+                         f"test_entropy={gpclf_entropy_te.mean():.3f} "
+                         f"known_entropy={gpclf_entropy_vd.mean():.3f} "
+                         f"gap={gpclf_entropy_te.mean()-gpclf_entropy_vd.mean():+.3f}")
         else:
             log.warning("  GP classifier skipped: only 1 unique type in training fold")
     except Exception as exc:
         log.warning(f"  GP classifier failed: {exc}")
 
-    # 4-way rank fusion (GP var + kNN + Maha + GP classifier entropy)
+    # ── 4c. Embedding distance (proposal §7: shift analysis) ──────────────
+    # Mean distance from test embeddings to nearest training embedding.
+    # Proposal requires: "calibration tracked against shift, measured as the
+    # mean embedding distance between the held-out type and the training types."
+    try:
+        from sklearn.neighbors import NearestNeighbors as _NN
+        nn_emb = _NN(n_neighbors=1, metric="euclidean").fit(X_tr.astype(np.float64))
+        emb_dist = float(nn_emb.kneighbors(X_te.astype(np.float64))[0].mean())
+    except Exception:
+        emb_dist = float("nan")
+
+    # fused5 (4-way: GP var + kNN + Maha + GPclf entropy)
     if gpclf_entropy_te is not None:
         _fused5_all = rank_fuse(
             np.concatenate([gp_var_vd, gp_var_vn, gp_var_te]),
@@ -149,6 +233,19 @@ def run_single_fold(
         fused5_te = _fused5_all[n_vd + n_vn:]
     else:
         fused5_vd = fused5_vn = fused5_te = None
+
+    # fused3 (best-pair + prototype: GPclf + Maha + Proto)
+    if gpclf_entropy_te is not None and proto_te is not None:
+        _fused3_all = rank_fuse(
+            np.concatenate([gpclf_entropy_vd, gpclf_entropy_vn, gpclf_entropy_te]),
+            np.concatenate([maha_vd,          maha_vn,          maha_te]),
+            np.concatenate([proto_vd,         proto_vn,         proto_te]),
+        )
+        fused3_vd = _fused3_all[:n_vd]
+        fused3_vn = _fused3_all[n_vd:n_vd + n_vn]
+        fused3_te = _fused3_all[n_vd + n_vn:]
+    else:
+        fused3_vd = fused3_vn = fused3_te = None
 
     # ── 5. Combine val splits for threshold optimisation ──────────────────
     # Labels: 1 = known defective (positive for novelty task), 0 = normal
@@ -203,9 +300,21 @@ def run_single_fold(
         "gp_class_prob_val_def":    gp_cls_prob_vd.tolist(),
         "gp_class_labels_val_def":  gp_cls_labels_vd.tolist(),
         "severity_log_threshold":   log_thresh,
+        "variance_calibration_T":   T_cal,
+
+        # ── Proposal §7: embedding distance (shift analysis) ──────────────
+        "embedding_dist_test_to_train": emb_dist,
     }
 
-    # Enhancement B: GP type classifier entropy scores (optional)
+    # Prototype distance (optional, requires type labels)
+    if proto_te is not None:
+        result.update({
+            "proto_val_scores":    _val(proto_vd, proto_vn),
+            "proto_known_scores":  proto_vd.tolist(),
+            "proto_test_scores":   proto_te.tolist(),
+        })
+
+    # Enhancement B: GP type classifier + fused combinations (optional)
     if gpclf_entropy_te is not None:
         result.update({
             "gpclf_val_scores":    _val(gpclf_entropy_vd, gpclf_entropy_vn),
@@ -215,6 +324,12 @@ def run_single_fold(
             "fused5_known_scores": fused5_vd.tolist(),
             "fused5_test_scores":  fused5_te.tolist(),
         })
+        if fused3_te is not None:
+            result.update({
+                "fused3_val_scores":   _val(fused3_vd, fused3_vn),
+                "fused3_known_scores": fused3_vd.tolist(),
+                "fused3_test_scores":  fused3_te.tolist(),
+            })
 
     return result
 
@@ -244,8 +359,12 @@ def run_all_folds(
         if resume and out_path.exists():
             with open(out_path) as f:
                 cached = json.load(f)
-            # Skip only if both fused and GP-classifier keys are present
-            if "fused_test_scores" in cached and "gpclf_test_scores" in cached:
+            # Skip only if all new keys (classifier + proto + calibration) are present
+            if all(k in cached for k in (
+                "fused_test_scores", "gpclf_test_scores",
+                "proto_test_scores", "variance_calibration_T",
+                "embedding_dist_test_to_train",
+            )):
                 log.info(f"[{i+1}/{len(folds)}] Skip {fid} (cached)")
                 results.append(cached)
                 continue

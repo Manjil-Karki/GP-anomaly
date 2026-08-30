@@ -125,14 +125,20 @@ def calibrate_folds(
     coverage_list = []
     all_pit       = []
 
+    emb_dist_list  = []
+    T_cal_list     = []
+
     for r in fold_results:
         if "gp_mean_val_def" not in r or "val_severity" not in r:
             continue
 
         mu      = np.array(r["gp_mean_val_def"], dtype=np.float64)
         sev     = np.array(r["val_severity"],     dtype=np.float64)
-        known_v = np.array(r["known_scores"],     dtype=np.float64)  # GP variance on val_def
+        # Use calibrated variance (T×σ²) for PI and PIT if available
+        T_cal   = float(r.get("variance_calibration_T", 1.0))
+        known_v = np.array(r["known_scores"], dtype=np.float64) * (T_cal ** 2)
 
+        T_cal_list.append(T_cal)
         rmse_list.append(regression_rmse(mu.tolist(), sev.tolist()))
 
         cov = interval_coverage(mu, known_v, sev, alpha=0.90)
@@ -141,10 +147,15 @@ def calibrate_folds(
         pit = pit_values(mu, known_v, sev)
         all_pit.extend(pit.tolist())
 
+        if "embedding_dist_test_to_train" in r:
+            emb_dist_list.append(float(r["embedding_dist_test_to_train"]))
+
     return {
         "mean_rmse":              float(np.nanmean(rmse_list)) if rmse_list else float("nan"),
         "std_rmse":               float(np.nanstd(rmse_list))  if rmse_list else float("nan"),
         "mean_90pct_coverage":    float(np.nanmean(coverage_list)) if coverage_list else float("nan"),
+        "mean_variance_cal_T":    float(np.nanmean(T_cal_list)) if T_cal_list else float("nan"),
+        "mean_embedding_dist":    float(np.nanmean(emb_dist_list)) if emb_dist_list else float("nan"),
         "pit_values":             all_pit,
         "n_folds_calibrated":     len(rmse_list),
     }

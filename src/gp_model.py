@@ -256,18 +256,19 @@ def gp_class_probability(
     X_test: np.ndarray,
     fitted: FittedGP,
     log_threshold: float,
+    variance_scale: float = 1.0,
 ) -> np.ndarray:
     """
     P(log_severity > log_threshold | x) from the GP predictive distribution.
-    = 1 - Φ((log_threshold − μ(x)) / σ(x))
+    = 1 - Φ((log_threshold − μ(x)) / (variance_scale × σ(x)))
 
-    This replaces the min-max-normalised GP variance proxy used previously.
-    The result is a true probability in [0,1] that can be used for a
-    calibrated reliability diagram (C2), Brier score, and ECE.
+    variance_scale > 1 inflates σ to correct for ExactGP overconfidence.
+    The scale is determined per fold by binary search on val_def PI coverage
+    (see novelty.py: _calibrate_variance_scale).
     """
     from scipy.stats import norm as _norm
     mean, var = predict_gp(X_test, fitted)
-    sigma = np.sqrt(np.clip(var, 1e-12, None))
+    sigma = variance_scale * np.sqrt(np.clip(var, 1e-12, None))
     return (1.0 - _norm.cdf((log_threshold - mean) / sigma)).astype(np.float64)
 
 

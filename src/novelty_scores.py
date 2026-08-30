@@ -72,6 +72,52 @@ def mahalanobis_score(
     return scores.astype(np.float64)
 
 
+def prototype_distance_score(
+    X_test: np.ndarray,
+    X_train: np.ndarray,
+    type_labels: np.ndarray,
+    reg: float = 1e-4,
+) -> np.ndarray:
+    """
+    Per-class Mahalanobis: minimum distance from each test point to the nearest
+    per-type distribution (centroid + covariance), not the global centroid.
+
+    Global Mahalanobis (single centroid) misses cases where a novel type lands
+    near the global mean but far from all per-type clusters.  This score is
+    sensitive to that structure.
+
+    Falls back to Euclidean prototype distance if per-class covariance is
+    ill-conditioned (< 2 samples per type).
+    """
+    X_tr = X_train.astype(np.float64)
+    X_te = X_test.astype(np.float64)
+    unique_types = np.unique(type_labels)
+    min_dists = np.full(len(X_te), np.inf)
+
+    for k in unique_types:
+        mask = type_labels == k
+        X_k  = X_tr[mask]
+        mu_k = X_k.mean(axis=0)
+
+        if X_k.shape[0] >= 2:
+            cov_k = np.cov(X_k.T, ddof=1)
+            if cov_k.ndim == 0:
+                cov_k = np.array([[float(cov_k)]])
+            cov_k += np.eye(cov_k.shape[0]) * reg
+            try:
+                VI_k = np.linalg.inv(cov_k)
+                diff = X_te - mu_k
+                d    = np.sqrt(np.einsum("ni,ij,nj->n", diff, VI_k, diff))
+            except np.linalg.LinAlgError:
+                d = np.linalg.norm(X_te - mu_k, axis=1)
+        else:
+            d = np.linalg.norm(X_te - mu_k, axis=1)
+
+        min_dists = np.minimum(min_dists, d)
+
+    return min_dists.astype(np.float64)
+
+
 def rank_fuse(*arrays: np.ndarray) -> np.ndarray:
     """
     Rank-normalise each score array to [0,1] then average.
