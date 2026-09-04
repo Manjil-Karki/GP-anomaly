@@ -16,7 +16,10 @@ from .gp_model import (
     gp_class_probability,
     FittedGPClassifier, fit_gp_type_classifier, predict_gp_type_entropy,
 )
-from .novelty_scores import knn_score, mahalanobis_score, prototype_distance_score, rank_fuse
+from .novelty_scores import (
+    knn_score, mahalanobis_score, prototype_distance_score,
+    lof_score, rank_fuse, zscore_fuse,
+)
 from .pca_transform import FoldPCA, fit_fold_pca
 
 log = logging.getLogger(__name__)
@@ -35,6 +38,21 @@ def _score_split(
     knn       = knn_score(X, X_train, k=KNN_K)
     maha      = mahalanobis_score(X, X_train)
     return gp_var, knn, maha
+
+
+def _fit_lof(X_train: np.ndarray, k: int = 5):
+    """Fit Isolation Forest on training set. Returns fitted clf."""
+    from sklearn.ensemble import IsolationForest
+    n_est = min(200, max(50, len(X_train) * 2))
+    clf = IsolationForest(n_estimators=n_est, random_state=42, contamination="auto")
+    clf.fit(X_train.astype(np.float64))
+    return clf
+
+
+def _lof_predict(clf, X: np.ndarray) -> np.ndarray:
+    if clf is None:
+        return np.zeros(len(X), dtype=np.float64)
+    return (-clf.score_samples(X.astype(np.float64))).astype(np.float64)
 
 
 def _calibrate_variance_scale(
@@ -123,6 +141,12 @@ def run_single_fold(
     gp_var_vd,  knn_vd,  maha_vd  = _score_split(X_vd, X_tr, fitted)
     gp_var_vn,  knn_vn,  maha_vn  = _score_split(X_vn, X_tr, fitted)
     gp_var_te,  knn_te,  maha_te  = _score_split(X_te, X_tr, fitted)
+
+    # LOF: fit once on training set, apply to all splits
+    _lof_clf = _fit_lof(X_tr, k=KNN_K)
+    lof_vd   = _lof_predict(_lof_clf, X_vd)
+    lof_vn   = _lof_predict(_lof_clf, X_vn)
+    lof_te   = _lof_predict(_lof_clf, X_te)
 
     # Rank-fused scores: ranks computed JOINTLY across all three splits so
     # the cross-split ordering (novel > known) is preserved for AUROC.
@@ -247,6 +271,44 @@ def run_single_fold(
     else:
         fused3_vd = fused3_vn = fused3_te = None
 
+    # fused2z: zscore_fuse(GPclf + Maha) — preserves magnitude over rank_fuse
+    if gpclf_entropy_te is not None:
+        _fused2z_all = zscore_fuse(
+            np.concatenate([gpclf_entropy_vd, gpclf_entropy_vn, gpclf_entropy_te]),
+            np.concatenate([maha_vd,          maha_vn,          maha_te]),
+        )
+        fused2z_vd = _fused2z_all[:n_vd]
+        fused2z_vn = _fused2z_all[n_vd:n_vd + n_vn]
+        fused2z_te = _fused2z_all[n_vd + n_vn:]
+    else:
+        fused2z_vd = fused2z_vn = fused2z_te = None
+
+    # fused_lof: rank_fuse(GPclf + Maha + LOF) — adds local density signal
+    if gpclf_entropy_te is not None:
+        _fused_lof_all = rank_fuse(
+            np.concatenate([gpclf_entropy_vd, gpclf_entropy_vn, gpclf_entropy_te]),
+            np.concatenate([maha_vd,          maha_vn,          maha_te]),
+            np.concatenate([lof_vd,           lof_vn,           lof_te]),
+        )
+        fused_lof_vd = _fused_lof_all[:n_vd]
+        fused_lof_vn = _fused_lof_all[n_vd:n_vd + n_vn]
+        fused_lof_te = _fused_lof_all[n_vd + n_vn:]
+    else:
+        fused_lof_vd = fused_lof_vn = fused_lof_te = None
+
+    # fused_lofz: zscore_fuse(GPclf + Maha + LOF) — best candidate for Run 6
+    if gpclf_entropy_te is not None:
+        _fused_lofz_all = zscore_fuse(
+            np.concatenate([gpclf_entropy_vd, gpclf_entropy_vn, gpclf_entropy_te]),
+            np.concatenate([maha_vd,          maha_vn,          maha_te]),
+            np.concatenate([lof_vd,           lof_vn,           lof_te]),
+        )
+        fused_lofz_vd = _fused_lofz_all[:n_vd]
+        fused_lofz_vn = _fused_lofz_all[n_vd:n_vd + n_vn]
+        fused_lofz_te = _fused_lofz_all[n_vd + n_vn:]
+    else:
+        fused_lofz_vd = fused_lofz_vn = fused_lofz_te = None
+
     # ── 5. Combine val splits for threshold optimisation ──────────────────
     # Labels: 1 = known defective (positive for novelty task), 0 = normal
     val_labels = np.concatenate([
@@ -279,6 +341,11 @@ def run_single_fold(
         "knn_val_scores":    _val(knn_vd, knn_vn),
         "knn_known_scores":  knn_vd.tolist(),
         "knn_test_scores":   knn_te.tolist(),
+
+        # ── LOF method (local outlier factor) ─────────────────────────────
+        "lof_val_scores":    _val(lof_vd, lof_vn),
+        "lof_known_scores":  lof_vd.tolist(),
+        "lof_test_scores":   lof_te.tolist(),
 
         # ── Mahalanobis method (Lee et al. 2018) ─────────────────────────
         "maha_val_scores":   _val(maha_vd, maha_vn),
@@ -330,6 +397,24 @@ def run_single_fold(
                 "fused3_known_scores": fused3_vd.tolist(),
                 "fused3_test_scores":  fused3_te.tolist(),
             })
+        if fused2z_te is not None:
+            result.update({
+                "fused2z_val_scores":   _val(fused2z_vd, fused2z_vn),
+                "fused2z_known_scores": fused2z_vd.tolist(),
+                "fused2z_test_scores":  fused2z_te.tolist(),
+            })
+        if fused_lof_te is not None:
+            result.update({
+                "fused_lof_val_scores":   _val(fused_lof_vd, fused_lof_vn),
+                "fused_lof_known_scores": fused_lof_vd.tolist(),
+                "fused_lof_test_scores":  fused_lof_te.tolist(),
+            })
+        if fused_lofz_te is not None:
+            result.update({
+                "fused_lofz_val_scores":   _val(fused_lofz_vd, fused_lofz_vn),
+                "fused_lofz_known_scores": fused_lofz_vd.tolist(),
+                "fused_lofz_test_scores":  fused_lofz_te.tolist(),
+            })
 
     return result
 
@@ -359,11 +444,12 @@ def run_all_folds(
         if resume and out_path.exists():
             with open(out_path) as f:
                 cached = json.load(f)
-            # Skip only if all new keys (classifier + proto + calibration) are present
+            # Skip only if all keys (including Run 6 additions) are present
             if all(k in cached for k in (
                 "fused_test_scores", "gpclf_test_scores",
                 "proto_test_scores", "variance_calibration_T",
                 "embedding_dist_test_to_train",
+                "lof_test_scores", "fused_lofz_test_scores",
             )):
                 log.info(f"[{i+1}/{len(folds)}] Skip {fid} (cached)")
                 results.append(cached)

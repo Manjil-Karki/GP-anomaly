@@ -118,6 +118,50 @@ def prototype_distance_score(
     return min_dists.astype(np.float64)
 
 
+def lof_score(
+    X_test: np.ndarray,
+    X_train: np.ndarray,
+    n_neighbors: int = 5,
+) -> np.ndarray:
+    """
+    Isolation Forest novelty score — better than LOF in high-dimensional
+    small-N settings (our regime: 64D, 20–120 training images).
+
+    LOF relies on k-NN local density which degrades in high dimensions
+    (distance concentration).  Isolation Forest builds random trees that
+    isolate points by recursive splits; anomalies are isolated by fewer
+    splits → shorter average path length → higher anomaly score.
+    Works well with n_train << n_features and produces more stable scores.
+
+    score_samples returns negative anomaly score (higher = more normal),
+    so we negate to get novelty score (higher = more novel).
+    """
+    from sklearn.ensemble import IsolationForest
+    n_est = min(200, max(50, len(X_train) * 2))
+    clf = IsolationForest(n_estimators=n_est, random_state=42, contamination="auto")
+    clf.fit(X_train.astype(np.float64))
+    return (-clf.score_samples(X_test.astype(np.float64))).astype(np.float64)
+
+
+def zscore_fuse(*arrays: np.ndarray) -> np.ndarray:
+    """
+    Z-score normalise each score array (jointly across the concatenated
+    input — caller must pass the full joint array) then sum.
+
+    Unlike rank_fuse which discards magnitude, zscore_fuse preserves how
+    extreme each outlier score is: an image with z=+4 in GPclf space
+    contributes more than one with z=+0.5, whereas both would be assigned
+    rank/(n-1) ≈ 1.0 by rank_fuse.  This typically improves AUROC when
+    signal magnitudes are informative (outliers are not just ranked #1 but
+    are genuinely far from the distribution).
+    """
+    result = np.zeros(len(arrays[0]), dtype=np.float64)
+    for a in arrays:
+        a = a.astype(np.float64)
+        result += (a - a.mean()) / (a.std() + 1e-8)
+    return result
+
+
 def rank_fuse(*arrays: np.ndarray) -> np.ndarray:
     """
     Rank-normalise each score array to [0,1] then average.

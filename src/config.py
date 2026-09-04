@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT       = ROOT / "data" / "mvtec"
 MANIFEST_PATH   = ROOT / "data" / "manifest.csv"
 FOLDS_PATH      = ROOT / "data" / "folds.json"
-EMBEDDINGS_DIR  = ROOT / "data" / "embeddings"
+EMBEDDINGS_DIR  = ROOT / "data" / "embeddings_vitl14"
 
 RESULTS_DIR         = ROOT / "results"
 FIGURES_DIR         = RESULTS_DIR / "figures"
@@ -16,10 +16,10 @@ BASELINE_RESULTS_DIR = RESULTS_DIR / "baseline_results"
 EVAL_DIR            = RESULTS_DIR / "evaluation"
 
 # --- Image preprocessing ---
-IMAGE_SIZE = 518  # DINOv2 ViT-B/14 native resolution
+IMAGE_SIZE = 518  # DINOv2 ViT-L/14 native resolution (same patch size as ViT-B/14)
 
 # --- PCA sweep ---
-PCA_DIMS = [8, 12, 16, 32]
+PCA_DIMS = [8, 12, 16, 32, 64]
 
 # --- GP optimisation ---
 GP_N_RESTARTS = 10
@@ -41,7 +41,7 @@ MLP_EPOCHS     = 50
 MLP_HIDDEN     = [256, 128, 64]
 
 # --- Batch sizes ---
-EMBED_BATCH_SIZE = 32
+EMBED_BATCH_SIZE = 16  # reduced from 32 — ViT-L/14 is ~2.5× larger than ViT-B/14
 
 # --- Evaluation ---
 SIGNIFICANCE_LEVEL = 0.05
@@ -56,6 +56,6 @@ ALL_CATEGORIES = [
 ]
 LODTO_CATEGORIES = [c for c in ALL_CATEGORIES if c != "toothbrush"]
 
-# --- DINOv2 ViT-B/14 output dimension per token ---
-# Embedding strategy: [L2(cls) | L2(patch_mean)] → 2 × 768 = 1536 stored per image
-DINO_EMBED_DIM = 1536
+# --- DINOv2 ViT-L/14 output dimension per token ---
+# Embedding strategy: [L2(cls) | L2(patch_mean)] → 2 × 1024 = 2048 stored per image
+DINO_EMBED_DIM = 2048

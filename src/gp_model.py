@@ -112,21 +112,34 @@ def _fit_single_kernel(
     best_lml: float = -np.inf
     best_state: Optional[dict] = None
 
+    # Median heuristic: initialise length-scales to median pairwise distance.
+    # Puts L-BFGS in a sensible basin; far better than GPyTorch's default 1.0.
+    X_np = train_x.cpu().numpy()
+    n_sub = min(200, len(X_np))
+    idx_sub = rng.choice(len(X_np), n_sub, replace=False)
+    X_sub = X_np[idx_sub]
+    diffs = X_sub[:, None, :] - X_sub[None, :, :]          # (n, n, d)
+    dists = np.sqrt((diffs ** 2).sum(-1))                   # (n, n)
+    median_dist = float(np.median(dists[dists > 0])) if (dists > 0).any() else 1.0
+    median_dist = max(median_dist, 1e-3)
+
     for restart in range(n_restarts):
         covar = _make_covar(kernel_name, d).to(device).double()
         lik   = GaussianLikelihood().to(device).double()
         model = SeverityGP(train_x, train_y, lik, covar).to(device).double()
 
-        if restart > 0:
-            with torch.no_grad():
+        with torch.no_grad():
+            # Always initialize length-scales to median heuristic (± jitter for restarts)
+            scale = median_dist if restart == 0 else float(rng.uniform(0.5, 2.0)) * median_dist
+            for mod in model.covar_module.modules():
+                if hasattr(mod, "lengthscale") and mod.lengthscale is not None:
+                    val = np.full(mod.lengthscale.shape, scale)
+                    mod.lengthscale = torch.tensor(val, dtype=torch.float64, device=device)
+            if restart > 0:
                 lik.noise = torch.tensor(float(rng.uniform(1e-4, 0.5)), dtype=torch.float64, device=device)
-                # Randomise outputscale
                 for mod in model.covar_module.modules():
                     if hasattr(mod, "outputscale"):
                         mod.outputscale = torch.tensor(float(rng.uniform(0.1, 5.0)), dtype=torch.float64, device=device)
-                    if hasattr(mod, "lengthscale") and mod.lengthscale is not None:
-                        val = rng.uniform(0.1, 5.0, size=mod.lengthscale.shape)
-                        mod.lengthscale = torch.tensor(val, dtype=torch.float64, device=device)
 
         model.train(); lik.train()
         mll = ExactMarginalLogLikelihood(lik, model)
@@ -341,13 +354,43 @@ def fit_gp_type_classifier(
     model.train()
     likelihood.train()
     mll = ExactMarginalLogLikelihood(likelihood, model)
-    opt = torch.optim.Adam(model.parameters(), lr=0.1)
 
-    for _ in range(max_iter):
+    # Adam warmup (20 steps) moves params out of the default basin before L-BFGS.
+    # Without warmup, DirichletGPC Cholesky can fail immediately in L-BFGS.
+    adam = torch.optim.Adam(
+        list(model.parameters()) + list(likelihood.parameters()), lr=0.1
+    )
+    for _ in range(20):
+        adam.zero_grad()
+        try:
+            loss = -mll(model(train_x), likelihood.transformed_targets).sum()
+            if torch.isfinite(loss):
+                loss.backward()
+                adam.step()
+        except Exception:
+            break
+
+    # L-BFGS refinement from the Adam-warmed starting point.
+    opt = torch.optim.LBFGS(
+        list(model.parameters()) + list(likelihood.parameters()),
+        lr=1.0, max_iter=max_iter, line_search_fn="strong_wolfe",
+    )
+
+    def _closure():
         opt.zero_grad()
-        loss = -mll(model(train_x), likelihood.transformed_targets).sum()
-        loss.backward()
-        opt.step()
+        try:
+            loss = -mll(model(train_x), likelihood.transformed_targets).sum()
+            if torch.isfinite(loss):
+                loss.backward()
+                return loss
+        except Exception:
+            pass
+        return torch.tensor(float("inf"), dtype=torch.float64, device=device)
+
+    try:
+        opt.step(_closure)
+    except Exception:
+        pass
 
     model.eval()
     likelihood.eval()
